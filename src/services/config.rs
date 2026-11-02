@@ -50,6 +50,97 @@ impl DbType {
     }
 }
 
+pub const HOOK_DEFAULT_TIMEOUT_SECS: u64 = 300;
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HookCommand {
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub container: Option<String>,
+    #[serde(default)]
+    pub user: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Hooks {
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub pre: Option<HookCommand>,
+    #[serde(default)]
+    pub post: Option<HookCommand>,
+    #[serde(default)]
+    pub on_success: Option<HookCommand>,
+    #[serde(default)]
+    pub on_failure: Option<HookCommand>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Pre,
+    Post,
+    OnSuccess,
+    OnFailure,
+}
+
+impl Phase {
+    pub const ALL: [Phase; 4] = [Phase::Pre, Phase::Post, Phase::OnSuccess, Phase::OnFailure];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Phase::Pre => "pre",
+            Phase::Post => "post",
+            Phase::OnSuccess => "on_success",
+            Phase::OnFailure => "on_failure",
+        }
+    }
+
+    pub fn command(self, hooks: &Hooks) -> Option<&HookCommand> {
+        match self {
+            Phase::Pre => hooks.pre.as_ref(),
+            Phase::Post => hooks.post.as_ref(),
+            Phase::OnSuccess => hooks.on_success.as_ref(),
+            Phase::OnFailure => hooks.on_failure.as_ref(),
+        }
+    }
+}
+
+impl Hooks {
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs.unwrap_or(HOOK_DEFAULT_TIMEOUT_SECS)
+    }
+
+    fn validate(&self, db_name: &str) -> Result<(), String> {
+        for p in Phase::ALL {
+            let phase = p.as_str();
+            if let Some(hook) = p.command(self) {
+                if hook
+                    .command
+                    .first()
+                    .is_none_or(|program| program.trim().is_empty())
+                {
+                    return Err(format!("Empty command in hooks.{phase} for '{db_name}'"));
+                }
+                if hook
+                    .container
+                    .as_deref()
+                    .is_some_and(|c| c.trim().is_empty())
+                {
+                    return Err(format!("Empty container in hooks.{phase} for '{db_name}'"));
+                }
+                if hook.user.is_some() && hook.container.is_none() {
+                    return Err(format!(
+                        "hooks.{phase} for '{db_name}' sets user without container (user only applies to docker exec)"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DatabaseConfig {
@@ -67,6 +158,8 @@ pub struct DatabaseConfig {
     pub volume_name: String,
     pub container_name: Option<String>,
     pub options: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub hooks: Option<Hooks>,
 }
 
 #[allow(dead_code)]
@@ -92,6 +185,8 @@ pub struct InputDatabaseConfig {
     pub volume_name: Option<String>,
     pub container_name: Option<String>,
     pub options: Option<HashMap<String, serde_json::Value>>,
+    #[serde(default)]
+    pub hooks: Option<Hooks>,
 }
 
 #[allow(dead_code)]
@@ -126,9 +221,12 @@ pub fn files_method(cfg: &DatabaseConfig) -> &'static str {
 }
 
 fn is_size(value: &str) -> bool {
-    let number = value.strip_suffix(|suffix: char| "bkmgtp".contains(suffix.to_ascii_lowercase())).unwrap_or(value);
+    let number = value
+        .strip_suffix(|suffix: char| "bkmgtp".contains(suffix.to_ascii_lowercase()))
+        .unwrap_or(value);
     let (whole, fraction) = number.split_once('.').unwrap_or((number, "0"));
-    let all_digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let all_digits =
+        |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
     all_digits(whole) && all_digits(fraction)
 }
 
@@ -205,7 +303,11 @@ pub fn build_config(db: InputDatabaseConfig) -> Result<DatabaseConfig, String> {
         _ => optional(&db.path),
     };
     if matches!(db.db_type, DbType::Files) {
-        if let Some(method) = db.options.as_ref().and_then(|options| options.get("method")) {
+        if let Some(method) = db
+            .options
+            .as_ref()
+            .and_then(|options| options.get("method"))
+        {
             if !method.as_str().is_some_and(|m| FILES_METHODS.contains(&m)) {
                 return Err(format!(
                     "Unknown method {method} for files source '{}' (expected archive, snapshot, sync or copy)",
@@ -213,7 +315,11 @@ pub fn build_config(db: InputDatabaseConfig) -> Result<DatabaseConfig, String> {
                 ));
             }
         }
-        if let Some(limit) = db.options.as_ref().and_then(|options| options.get("max_delete")) {
+        if let Some(limit) = db
+            .options
+            .as_ref()
+            .and_then(|options| options.get("max_delete"))
+        {
             if !limit.is_u64() {
                 return Err(format!(
                     "Invalid max_delete {limit} for files source '{}' (expected a whole number >= 0)",
@@ -221,7 +327,11 @@ pub fn build_config(db: InputDatabaseConfig) -> Result<DatabaseConfig, String> {
                 ));
             }
         }
-        if let Some(size) = db.options.as_ref().and_then(|options| options.get("max_delete_size")) {
+        if let Some(size) = db
+            .options
+            .as_ref()
+            .and_then(|options| options.get("max_delete_size"))
+        {
             if !size.as_str().is_some_and(is_size) {
                 return Err(format!(
                     "Invalid max_delete_size {size} for files source '{}' (expected a size such as 500M or 10G)",
@@ -238,6 +348,9 @@ pub fn build_config(db: InputDatabaseConfig) -> Result<DatabaseConfig, String> {
         DbType::DockerVolume => required(&db.volume_name, &db.name, "volume_name")?,
         _ => optional(&db.volume_name),
     };
+    if let Some(hooks) = &db.hooks {
+        hooks.validate(&db.name)?;
+    }
 
     Ok(DatabaseConfig {
         name: db.name,
@@ -253,6 +366,7 @@ pub fn build_config(db: InputDatabaseConfig) -> Result<DatabaseConfig, String> {
         volume_name,
         container_name: db.container_name.clone(),
         options: db.options.unwrap_or_default(),
+        hooks: db.hooks,
     })
 }
 
